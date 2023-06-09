@@ -22,6 +22,12 @@ queue.on('active', () => {
 	console.log(`Working on request.  Size: ${queue.size}  Pending: ${queue.pending}`);
 });
 
+queue.on('add', () => {
+  console.log(`Added to queue.  Size: ${queue.size}  Pending: ${queue.pending}`);
+});
+
+const cancelledRequests = new Set();
+
 // End Queue
 
 const _proxyUrl = (req, res, url, {
@@ -79,7 +85,7 @@ const _setHeaders = res => {
 
 const app = express();
 
-const queueAndRun = (req, res, {
+const queueAndRun = async (req, res, {
   rewriteHost = false,
 } = {}) => {
   if (req.url.startsWith('/midasDepth')) {
@@ -142,38 +148,51 @@ const queueAndRun = (req, res, {
   }
 }
 
-const handleRequest = async (req, res, next) => {
+async function handleRequest (req, res, next) {
+  req.id = Math.random()
   _setHeaders(res);
 
-  console.log('got req url', req.url);
+  console.info('got req url', req.url);
 
   // AI
   
   if (req.method === 'OPTIONS') {
     res.end();
+    return;
   }
 
-  let shouldCancel = false;
+  if (req.method === 'POST' || req.method === 'PUT') {
+    req.on('data', chunk => {
+      console.info(`Received ${chunk.length} bytes of data.`, req.id);
+    });
 
-  req.on('end', () => {
-    try {
-      tokenCheckQueue.add(async () => {
-        if (shouldCancel === false) {
-          queueAndRun(req, res);
-        } else {
-          console.warn('skipping job start because request is cancelled')
-        }
-      });
-    } catch (err) {
-      console.warn(err.stack);
-      res.status(500);
-      res.end();
-    }
-  });
+    req.on('end', async () => {
+      try {
+        await queue.add(async () => {
+          if (!cancelledRequests.has(req.id)) {
+            await queueAndRun(req, res);
+          } else {
+            console.info('cancelled request', req.id);
+            cancelledRequests.delete(req.id);
+          }
+        });
+      } catch (err) {
+        console.warn(err.stack);
+        res.status(500);
+        res.end();
+      }
+    });
 
-  req.on('close', () => {
-    shouldCancel = true;
-  });
+    req.socket.on('close', (hadError) => {
+      // no more data can be read or written to the socket, 
+      // but we don't really know why or how it was closed
+      cancelledRequests.add(req.id);
+      if (hadError) {
+        // This will be true if the socket "had a transmission error".
+        // The docs are not clear on what causes a transmission error.
+      }
+    });
+  }
 };
 app.all('*', handleRequest);
 
