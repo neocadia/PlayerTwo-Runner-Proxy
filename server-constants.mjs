@@ -30,3 +30,6 @@ export const PORTS = {
   FASTCHAT_WEB_SERVER_PORT: 9989,
   FASTCHAT: 9900,
 };
+
+export const RUNNER_HOST = 'ai-host.webaverse.com';
+export const PROXY_PORT = 80;

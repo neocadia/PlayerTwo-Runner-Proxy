@@ -2,12 +2,27 @@ import fs from 'fs';
 import http from 'http';
 import https from 'https';
 import express from 'express';
+import PQueue from 'p-queue';
 
 import {
   PORTS,
+  RUNNER_HOST,
+  PROXY_PORT
 } from './server-constants.mjs';
 
-//
+// Queue
+
+const queue = new PQueue({
+	concurrency: 1,
+	timeout: 15000,
+	throwOnTimeout: true
+});
+
+queue.on('active', () => {
+	console.log(`Working on request.  Size: ${queue.size}  Pending: ${queue.pending}`);
+});
+
+// End Queue
 
 const _proxyUrl = (req, res, url, {
   rewriteHost = false,
@@ -62,56 +77,49 @@ const _setHeaders = res => {
   }
 };
 
-const AI_HOST = `ai-host.webaverse.com`;
-
 const app = express();
-const handleRequest = async (req, res, next) => {
-  _setHeaders(res);
 
-  console.log('got req url', req.url);
-
-  // AI
-  
-  if (req.method === 'OPTIONS') {
-    res.end();
-  } else if (req.url.startsWith('/midasDepth')) {
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.MIDASDEPTH}${req.url}`);
+const queueAndRun = (req, res, {
+  rewriteHost = false,
+} = {}) => {
+  if (req.url.startsWith('/midasDepth')) {
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.MIDASDEPTH}${req.url}`);
   } else if (req.url.startsWith('/zoeDepth')) {
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.ZOEDEPTH}${req.url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.ZOEDEPTH}${req.url}`);
 
   } else if (req.url.startsWith('/api/imaginairy/')) {
     const urlAddition = req.url.replace(/^\/api\/imaginairy/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.IMAGE}${urlAddition}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.IMAGE}${urlAddition}`);
   } else if (req.url.startsWith('/api/falcon/')) {
     const u = req.url.replace(/^\/api\/falcon/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.FALCON}${u}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.FALCON}${u}`);
   } else if (req.url.startsWith('/api/pygmalion/')) {
     const u = req.url.replace(/^\/api\/pygmalion/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.FASTCHAT}${u}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.FASTCHAT}${u}`);
   } else if (['/api/ai/tts'].some(prefix => req.url.startsWith(prefix))) {
     const u = req.url.replace(/^\/api/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.TTS}${u}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.TTS}${u}`);
 
   } else if (['/api/depth/'].some(prefix => req.url.startsWith(prefix))) {
     const url = req.url.replace(/^\/api\/depth/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.DEPTH}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.DEPTH}${url}`);
 
   } else if (
     ['/api/mask2former/'].some(prefix => req.url.startsWith(prefix))
   ) {
     const url = req.url.replace(/\/api\/mask2former/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.MASK2FORMER}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.MASK2FORMER}${url}`);
     
   } else if (['/api/ocr'].some(prefix => req.url.startsWith(prefix))) {
     const url = req.url.replace(/\/api/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.DOCTR}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.DOCTR}${url}`);
   } else if (['/api/caption', '/api/vqa'].some(prefix => req.url.startsWith(prefix))) {
     const url = req.url.replace(/\/api/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.BLIP2}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.BLIP2}${url}`);
   
   } else if (['/api/imageSegmentation/'].some(prefix => req.url.startsWith(prefix))) {
     const url = req.url.replace(/\/api\/imageSegmentation/, '');
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.SEGMENTATION}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.SEGMENTATION}${url}`);
 
   } else if (['/api/irn/'].some(prefix => req.url.startsWith(prefix))) {
     const url = req.url.replace(/^\/api\/irn/, '');
@@ -127,17 +135,51 @@ const handleRequest = async (req, res, next) => {
   ) {
     // await aiServer.handleRequest(req, res);
     const url = req.url;
-    _proxyUrl(req, res, `http://${AI_HOST}:${PORTS.AI_SERVER}${url}`);
+    _proxyUrl(req, res, `http://${RUNNER_HOST}:${PORTS.AI_SERVER}${url}`);
   } else {
     res.status(404);
     res.end('not found');
   }
+}
+
+const handleRequest = async (req, res, next) => {
+  _setHeaders(res);
+
+  console.log('got req url', req.url);
+
+  // AI
+  
+  if (req.method === 'OPTIONS') {
+    res.end();
+  }
+
+  let shouldCancel = false;
+
+  req.on('end', () => {
+    try {
+      tokenCheckQueue.add(async () => {
+        if (shouldCancel === false) {
+          queueAndRun(req, res);
+        } else {
+          console.warn('skipping job start because request is cancelled')
+        }
+      });
+    } catch (err) {
+      console.warn(err.stack);
+      res.status(500);
+      res.end();
+    }
+  });
+
+  req.on('close', () => {
+    shouldCancel = true;
+  });
 };
 app.all('*', handleRequest);
 
 //
 
-const port = process.env.PORT || 80;
+const port = process.env.PORT || PROXY_PORT;
 
 //
 
